@@ -26,11 +26,15 @@ pub mod pallet {
         dispatch::DispatchError,
         pallet_prelude::{ValueQuery, *},
         sp_runtime::traits::{Hash, StaticLookup},
+        traits::{Currency, LockableCurrency, ReservableCurrency},
     };
     use frame_system::pallet_prelude::*;
 
-    pub type BalanceOf<T> = <T as pallet_assets::Config>::Balance;
+    pub type BalanceOf<T> = <<T as pallet::Config>::Currency as Currency<
+        <T as frame_system::Config>::AccountId,
+    >>::Balance;
     pub type PostId = u32;
+
     // type AccountIdLookupOf<T> = <<T as frame_system::Config>::Lookup as StaticLookup>::Source;
 
     #[pallet::pallet]
@@ -40,10 +44,11 @@ pub mod pallet {
     #[pallet::config]
     pub trait Config: frame_system::Config + pallet_assets::Config {
         type RuntimeEvent: From<Event<Self>> + IsType<<Self as frame_system::Config>::RuntimeEvent>;
-        // #[pallet::constant]
-        // type PostMinBytes: Get<u32>;
-        // #[pallet::constant]
-        // type PostMaxBytes: Get<u32>;
+        type Currency: Currency<Self::AccountId>
+            + ReservableCurrency<Self::AccountId>
+            + LockableCurrency<Self::AccountId>;
+
+        type Bond: Get<BalanceOf<Self>>;
     }
 
     #[pallet::type_value]
@@ -119,10 +124,12 @@ pub mod pallet {
     }
 
     #[pallet::storage]
+    #[pallet::getter(fn token_creators)]
     pub(super) type TokenCreators<T: Config> =
         StorageMap<_, Blake2_128Concat, T::AccountId, TokenCreatorsConfig<T>, OptionQuery>;
 
     #[pallet::storage]
+    #[pallet::getter(fn token_holders)]
     pub(super) type TokenHolders<T: Config> =
         StorageMap<_, Blake2_128Concat, T::AccountId, TokenHoldersConfig<T>, OptionQuery>;
 
@@ -210,37 +217,52 @@ pub mod pallet {
     impl<T: Config> Pallet<T> {
         #[pallet::call_index(0)]
         #[pallet::weight(10_000 + T::DbWeight::get().writes(1).ref_time())]
-        pub fn create_token(origin: OriginFor<T>, id: T::AssetId) -> DispatchResult {
+        pub fn create_token(
+            origin: OriginFor<T>,
+            id: T::AssetId,
+            amount: T::Balance,
+        ) -> DispatchResult {
             let who = ensure_signed(origin.clone())?;
             let admin = T::Lookup::unlookup(who.clone());
 
-            // ensure!(!pallet_assets::Asset::<T>::contains_key(id), Error::<T, I>::InUse);
-
+            // create token
             let created_assets = pallet_assets::Pallet::<T>::create(
                 origin.clone(),
                 id.clone().into(),
-                admin,
-                100_000_000_u32.into(),
+                admin.clone(),
+                amount,
             );
 
-            match created_assets {
+            // mint it after creation into the token creator
+            match pallet_assets::Pallet::<T>::mint(origin.clone(), id.clone().into(), admin, amount)
+            {
                 Ok(_) => {
-                    let bal = pallet_assets::Pallet::<T>::balance(id.clone(), who.clone());
+                    match created_assets {
+                        Ok(val) => {
+                            let bal = pallet_assets::Pallet::<T>::balance(id.clone(), who.clone());
 
-                    let token_creator = TokenCreatorsConfig {
-                        tokens_balance: bal,
-                        id: id.clone(),
+                            // dbg!(bal.clone());
+
+                            let token_creator = TokenCreatorsConfig {
+                                tokens_balance: bal,
+                                id: id.clone(),
+                            };
+
+                            TokenCreators::<T>::insert(who.clone(), token_creator);
+                            Self::deposit_event(Event::CreateTokens {
+                                user_id: who,
+                                token_id: id,
+                            });
+                            return Ok(val);
+                            // return Ok(());
+                            // Ok(());
+                        }
+                        Err(e) => return Err(e),
                     };
-
-                    TokenCreators::<T>::insert(who.clone(), token_creator);
-                    Self::deposit_event(Event::CreateTokens {
-                        user_id: who,
-                        token_id: id,
-                    });
-                    Ok(())
+                    // return Ok(());
                 }
-                Err(e) => Err(e),
-            }
+                Err(e) => return Err(e),
+            };
         }
 
         #[pallet::call_index(1)]
@@ -253,7 +275,7 @@ pub mod pallet {
         ) -> DispatchResult {
             let who = ensure_signed(origin.clone())?;
             let _admin = T::Lookup::unlookup(who.clone());
-            let target = T::Lookup::unlookup(account_id);
+            let target = T::Lookup::unlookup(account_id.clone());
 
             let transfer_assets = pallet_assets::Pallet::<T>::transfer(
                 origin.clone(),
@@ -270,7 +292,7 @@ pub mod pallet {
                         tokens_balance: bal,
                         id,
                     };
-                    TokenHolders::<T>::insert(who.clone(), token_holder);
+                    TokenHolders::<T>::insert(account_id, token_holder);
                     Self::deposit_event(Event::TransferTokens {
                         user_id: who,
                         token_id: id,
@@ -296,12 +318,12 @@ pub mod pallet {
 
             // check if post is valid
             ensure!(
-                (content.len() as u32) < MIN_TEXT_CONTENT,
+                (content.len() as u32) > MIN_TEXT_CONTENT,
                 <Error<T>>::PostNotEnoughBytes
             );
 
             ensure!(
-                (content.len() as u32) > MAX_TEXT_CONTENT,
+                (content.len() as u32) < MAX_TEXT_CONTENT,
                 <Error<T>>::PostTooManyBytes
             );
 
@@ -373,12 +395,12 @@ pub mod pallet {
 
             // check if comment is valid
             ensure!(
-                (comment_text.len() as u32) < MIN_TEXT_CONTENT,
+                (comment_text.len() as u32) > MIN_TEXT_CONTENT,
                 <Error<T>>::PostNotEnoughBytes
             );
 
             ensure!(
-                (comment_text.len() as u32) > MAX_TEXT_CONTENT,
+                (comment_text.len() as u32) < MAX_TEXT_CONTENT,
                 <Error<T>>::PostTooManyBytes
             );
 
@@ -425,7 +447,7 @@ pub mod pallet {
 
             // check the signer is a token holder
             ensure!(
-                <TokenHolders<T>>::get(who.clone()).is_some(),
+                <TokenCreators<T>>::get(who.clone()).is_some(),
                 <Error<T>>::InvalidSigner
             );
 
@@ -530,12 +552,12 @@ pub mod pallet {
 
             // check if postt is valid
             ensure!(
-                (content.len() as u32) < MIN_TEXT_CONTENT,
+                (content.len() as u32) > MIN_TEXT_CONTENT,
                 <Error<T>>::PostNotEnoughBytes
             );
 
             ensure!(
-                (content.len() as u32) > MAX_TEXT_CONTENT,
+                (content.len() as u32) < MAX_TEXT_CONTENT,
                 <Error<T>>::PostTooManyBytes
             );
 
@@ -586,12 +608,12 @@ pub mod pallet {
 
             // check if comment is valid
             ensure!(
-                (content.len() as u32) < MIN_TEXT_CONTENT,
+                (content.len() as u32) > MIN_TEXT_CONTENT,
                 <Error<T>>::PostNotEnoughBytes
             );
 
             ensure!(
-                (content.len() as u32) > MAX_TEXT_CONTENT,
+                (content.len() as u32) < MAX_TEXT_CONTENT,
                 <Error<T>>::PostTooManyBytes
             );
 
